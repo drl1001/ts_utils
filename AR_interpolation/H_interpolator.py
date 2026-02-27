@@ -30,7 +30,7 @@ import numpy as np
 import scipy 
 
 
-def _RBF(x1, x2, phi_name, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0):
+def _RBF(x1, x2, phi_name : str, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0):
     """
     Computes various radial basis functions (RBFs) between two position vectors.
 
@@ -140,7 +140,75 @@ def _RBF(x1, x2, phi_name, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=
 
 
 
-def _create_Afs(x : np.ndarray, a : np.ndarray, phi_name : np.ndarray, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0) -> np.ndarray:
+def _RBF_matrix(X1: np.ndarray, X2: np.ndarray, phi_name: str, norm_bias: tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0) -> np.ndarray:
+    """
+    Vectorized RBF evaluation between all pairs of points in X1 and X2.
+    Replaces the nested loop over _RBF(x1, x2) by computing the full
+    pairwise distance matrix via broadcasting, then applying the RBF
+    formula element-wise with numpy operations.
+
+    Parameters:
+    -----------
+    X1 : np.ndarray, shape (M, 3)
+    X2 : np.ndarray, shape (N, 3)
+
+    Returns:
+    --------
+    np.ndarray, shape (M, N)  where result[i,j] = RBF(X1[i], X2[j])
+    """
+    kx, ky, kz = norm_bias
+
+    # Broadcasting trick: expand dims so diff[i,j,:] = X1[i] - X2[j]
+    # X1[:, np.newaxis, :] has shape (M, 1, 3)
+    # X2[np.newaxis, :, :] has shape (1, N, 3)
+    # diff therefore has shape (M, N, 3)
+    diff = X1[:, np.newaxis, :] - X2[np.newaxis, :, :]
+
+    # Compute biased Euclidean distance for every (i,j) pair simultaneously
+    # r has shape (M, N)
+    r = np.sqrt(kx * diff[:,:,0]**2 + ky * diff[:,:,1]**2 + kz * diff[:,:,2]**2)
+    r_norm = r / r0  # normalised radius used by compact-support (Wendland) functions
+
+    # Apply the chosen RBF formula element-wise to the full (M, N) distance matrix
+    if phi_name == 'gaussian':
+        return np.exp(-alpha * r)
+
+    elif phi_name == 'thin_plate_spline':
+        # r=0 gives 0*log(0) which is 0 by convention; suppress the numpy warning
+        with np.errstate(divide='ignore', invalid='ignore'):
+            result = r**2 * np.log(r)
+        result[r == 0] = 0.0
+        return result
+
+    elif phi_name == 'multiquadric':
+        return np.sqrt(c**2 + r**2)
+
+    elif phi_name == 'inverse_multiquadric':
+        return 1.0 / np.sqrt(c**2 + r**2)
+
+    elif phi_name == 'wendland_c0':
+        # np.where applies the formula only where r_norm < 1, else 0 (compact support)
+        return np.where(r_norm < 1, (1 - r_norm)**2, 0.0)
+
+    elif phi_name == 'wendland_c2':
+        return np.where(r_norm < 1, (1 - r_norm)**4 * (4 * r_norm + 1), 0.0)
+
+    elif phi_name == 'wendland_c4':
+        return np.where(r_norm < 1, (1 - r_norm)**6 * (35 * r_norm**2 + 18 * r_norm + 3), 0.0)
+
+    elif phi_name == 'wendland_c6':
+        return np.where(r_norm < 1, (1 - r_norm)**8 * (32 * r_norm**3 + 25 * r_norm**2 + 8 * r_norm + 1), 0.0)
+
+    elif phi_name == 'euclid_hat':
+        return np.where(r < r0, np.pi * ((1/12) * r**3 - r0**2 * r + (4/3) * r0**3), 0.0)
+
+    else:
+        raise ValueError(f"Unknown basis function: {phi_name}. Valid options are: " +
+                         "'gaussian', 'thin_plate_spline', 'multiquadric', 'inverse_multiquadric', " +
+                         "'wendland_c0', 'wendland_c2', 'wendland_c4', 'wendland_c6', 'euclid_hat'")
+
+
+def _create_Afs(x : np.ndarray, a : np.ndarray, phi_name : str, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0) -> np.ndarray:
     '''
     Assemble matrix A_fs using Eqn 12 in [1]
 
@@ -196,26 +264,28 @@ def _create_Afs(x : np.ndarray, a : np.ndarray, phi_name : np.ndarray, norm_bias
     A_fs = np.zeros((N_a, N_s+4)) # initialise empty A_fs matrix
 
     A_fs[:,0] = 1 # first column of A_fs is 1
-    A_fs[:,1:4] = a # columns 2 to 4 are x_a, y_a, z_a 
-    
-    for i in range(N_a): # for each row (N_a rows in total)
-        for j in range(N_s): # columns 4 to end - compute RBFs
-            a_i = a[i] # coords of ith surface aerodynamic node
-            s_j = x[j] # coords of jth structural node
-            phi = _RBF(x1=a_i, 
-                       x2=s_j, 
-                       phi_name=phi_name,
-                       norm_bias=norm_bias,
-                       c=c,
-                       alpha=alpha,
-                       r0=r0,
-                    ) # compute RBF phi_ai_sj using Eqn [12]
-            A_fs[i,j+4] = phi
+    A_fs[:,1:4] = a # columns 2 to 4 are x_a, y_a, z_a
 
+    # Columns 4 onward: phi(a_i, x_j) for all (i,j) pairs at once
+    A_fs[:,4:] = _RBF_matrix(a, x, phi_name=phi_name, norm_bias=norm_bias, c=c, alpha=alpha, r0=r0)
+
+    # for i in range(N_a): # for each row (N_a rows in total)
+    #     for j in range(N_s): # columns 4 to end - compute RBFs
+    #         a_i = a[i] # coords of ith surface aerodynamic node
+    #         s_j = x[j] # coords of jth structural node
+    #         phi = _RBF(x1=a_i,
+    #                    x2=s_j,
+    #                    phi_name=phi_name,
+    #                    norm_bias=norm_bias,
+    #                    c=c,
+    #                    alpha=alpha,
+    #                    r0=r0,
+    #                 ) # compute RBF phi_ai_sj using Eqn [12]
+    #         A_fs[i,j+4] = phi
 
     return A_fs
 
-def _create_Css(x : np.ndarray, phi_name : np.ndarray, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0) -> np.ndarray:
+def _create_Css(x : np.ndarray, phi_name : str, norm_bias : tuple = (1.,1.,1.), c=1.0, alpha=1.0, r0=1.0) -> np.ndarray:
     '''
     Assembles matrix C_ss according to Eq 10 in [1].
 
@@ -262,23 +332,26 @@ def _create_Css(x : np.ndarray, phi_name : np.ndarray, norm_bias : tuple = (1.,1
     C_ss[1:4,4:] = x.T
     C_ss[4:, 1:4] = x
 
+    # Bottom-right block: phi(x_i, x_j) for all (i,j) pairs at once
+    C_ss[4:, 4:] = _RBF_matrix(x, x, phi_name=phi_name, norm_bias=norm_bias, c=c, alpha=alpha, r0=r0)
+
     # for i in range(4, N_s+4):
     #     for j in range(4, N_s+4):
     #         s_i = x[i]
     #         s_j = x[j]
     #     C_ss[i,j] = _RBF(x1=s_i, x2=s_j, phi_name=phi_name)
-    for i in range(N_s):
-        for j in range(N_s):
-            C_ss[i+4, j+4] = _RBF(
-                x1=x[i],
-                x2=x[j],
-                phi_name=phi_name,
-                norm_bias=norm_bias,
-                c=c,
-                alpha=alpha,
-                r0=r0,
-            )
-    
+    # for i in range(N_s):
+    #     for j in range(N_s):
+    #         C_ss[i+4, j+4] = _RBF(
+    #             x1=x[i],
+    #             x2=x[j],
+    #             phi_name=phi_name,
+    #             norm_bias=norm_bias,
+    #             c=c,
+    #             alpha=alpha,
+    #             r0=r0,
+    #         )
+
     return C_ss
         
         

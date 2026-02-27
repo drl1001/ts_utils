@@ -51,10 +51,7 @@ def extract_3D_grid(bdf_path, out_name, save_arrays=False, sort_ids=True, xref=F
 
 
 
-import numpy as np
-
-
-def select_root_nodes(nodes_3D: np.ndarray, y_root: float) -> np.ndarray:
+def select_root_nodes(nodes_3D: np.ndarray, y_root: float) -> tuple[np.ndarray, np.ndarray]:
     '''
     Extract nodes that are on the root of the wing. Do not interpolate forces from
     aerodynamic mesh onto these root nodes (they are buried within the fuselage in reality).
